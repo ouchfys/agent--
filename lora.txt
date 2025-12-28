@@ -1,0 +1,207 @@
+from datasets import Dataset
+import pandas as pd
+from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM
+from transformers import AutoModel
+from transformers import TrainingArguments
+from transformers import Trainer
+from transformers import DataCollatorForLanguageModeling
+from peft import LoraConfig, get_peft_model
+import torch
+from typing import Dict, List
+
+# 参数配置
+MODEL_NAME = "/home/zy/LLM/chatglm3-6b-32k/"  # 可替换为其他大模型如"meta-llama/Llama-2-7b-hf"
+DATASET_PATH = "./train.csv"  # 包含question和answer列的CSV文件
+OUTPUT_DIR = "./lora_results"
+DEVICE = "cpu"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
+
+
+# 数据预处理
+def prepare_dataset(dataset_path):
+    df = pd.read_csv(dataset_path)
+    raw_dataset = Dataset.from_pandas(df)
+    answer_prefix = "回答"
+    answer_prefix_tokens = tokenizer.encode(
+        answer_prefix,
+        truncation=True,
+        add_special_tokens=False,  # 不添加特殊token
+        return_attention_mask=False
+    )
+
+    def find_sublist(full: List[int], sub: List[int]) -> int:
+        """查找子序列在列表中的起始位置"""
+        len_sub = len(sub)
+        print(full)
+        print(sub)
+        for i in range(len(full) - len_sub + 1):
+            if full[i:i + len_sub] == sub:
+                return i
+        return -1
+
+    def validate_labels(input_ids: List[int], labels: List[int]) -> bool:
+        """验证标签是否正确生成"""
+        try:
+            # 检查标签长度一致性
+            assert len(input_ids) == len(labels), "长度不一致"
+
+            # 检查有效标签区域是否连续
+            valid_labels = [i for i, lbl in enumerate(labels) if lbl != -100]
+            if valid_labels:
+                assert all(i >= valid_labels[0] for i in valid_labels[1:]), "有效标签不连续"
+                assert min(valid_labels) >= len(answer_prefix_tokens), "有效区域过早开始"
+            return True
+        except AssertionError as e:
+            print(f"验证失败: {e}")
+            print(f"Input IDs: {input_ids}")
+            print(f"Labels:    {labels}")
+            return False
+
+    def preprocess_function(examples: Dict) -> Dict:
+        # 组合完整文本（问题 + 分隔符 + 回答 + 终止符）
+        texts = [
+            str(q) + " " + answer_prefix + "：" + str(a) + tokenizer.eos_token
+            for q, a in zip(examples["question"], examples["answer"])
+        ]
+
+        # Tokenization
+        tokenized = tokenizer(
+            texts,
+            max_length=128,
+            truncation=True,
+            padding="max_length",
+            add_special_tokens=False,
+            return_attention_mask=False,
+            #return_tensors="np"  # 使用numpy数组减少内存占用
+        )
+        
+
+        # 生成标签 ----------------------------------------------------------
+        all_labels = []
+        error_count = 0
+
+        for batch_idx in range(len(tokenized["input_ids"])):
+            #input_ids = tokenized["input_ids"][batch_idx].tolist()
+            #attn_mask = tokenized["attention_mask"][batch_idx].tolist()
+            input_ids = tokenized["input_ids"][batch_idx]
+            attn_mask = tokenized["attention_mask"][batch_idx]
+
+            # 定位分隔符起始位置
+            sep_start = find_sublist(input_ids, answer_prefix_tokens)
+
+            # 处理未找到分隔符的情况
+            if sep_start == -1:
+                error_count += 1
+                sep_start = 0  # 默认处理：整个序列视为回答
+                if error_count < 3:  # 仅打印前3个错误示例
+                    print(f"警告：未找到分隔符，样本内容：{texts[batch_idx]}")
+
+            # 计算有效区域起始位置（跳过分隔符）
+            sep_pos = sep_start + len(answer_prefix_tokens)
+
+            # 生成标签（同时考虑attention_mask）
+            labels = []
+            for pos, (tid, mask) in enumerate(zip(input_ids, attn_mask)):
+                # 满足以下条件才保留标签：
+                # 1. 位于分隔符之后
+                # 2. 属于有效文本区域（mask=1）
+                # 3. 不是padding部分（虽然mask已经处理，但二次确认）
+                if (pos >= sep_pos) and (mask == 1):
+                    labels.append(tid)
+                else:
+                    labels.append(-100)
+
+            # 验证标签有效性
+            if not validate_labels(input_ids, labels):
+                error_count += 1
+
+            all_labels.append(labels)
+        if error_count > 0:
+            print(f"总错误样本数：{error_count}/{len(tokenized['input_ids'])}")
+
+        return {
+            "input_ids": tokenized["input_ids"],
+            "attention_mask": tokenized["attention_mask"],
+            "labels": all_labels
+        }
+
+    processed_dataset = raw_dataset.map(
+        preprocess_function,
+        batched=True,
+        batch_size=1,  # 根据内存调整
+        #remove_columns=raw_dataset["train"].column_names
+    )
+    return processed_dataset
+
+
+# 加载数据集
+dataset = prepare_dataset(DATASET_PATH)
+
+# 初始化模型和分词器
+#model = AutoModel.from_pretrained(MODEL_NAME, trust_remote_code=True, device_map="auto", torch_dtype=torch.float16).cuda()
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True, device_map="cpu", use_cache=False)
+model.to(DEVICE)
+model.gradient_checkpointing_enable()
+
+#if torch.cuda.device_count() > 1:
+#    model = torch.nn.DataParallel(model)
+#model = model.to(DEVICE)
+
+# 配置LoRA
+peft_config = LoraConfig(
+    r=1,  # LoRA秩
+    lora_alpha=16,
+    target_modules=["query_key_value"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    #inference_mode=False
+)
+
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()  # 打印可训练参数占比
+p=1
+for name, param in model.named_parameters():
+    if "lora" not in name:
+        param.requires_grad = False
+        p=p+1
+print(p)
+# 训练参数配置
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=100,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=16,
+    learning_rate=2e-4,
+    logging_steps=10,
+    #save_strategy="steps",
+    save_steps=100,
+    gradient_checkpointing=True,     # 显存减少30%
+    fp16=True,  # 启用混合精度训练
+    evaluation_strategy="no",  # 无验证集
+    #save_total_limit=2,
+    #optim="adamw_torch",
+    #report_to="none",
+    #set_gradient_checkpointing=True,
+    #dataloader_num_workers=4,
+    #ddp_find_unused_parameters=False
+)
+
+# 创建Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=dataset,
+    data_collator=DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # 使用CLM（因果语言建模）
+    )
+)
+
+# 开始训练
+trainer.train()
+
+# 保存训练结果
+model.save_pretrained(OUTPUT_DIR)

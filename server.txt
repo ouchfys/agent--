@@ -1,0 +1,61 @@
+"""
+This script is a simple web demo based on Streamlit, showcasing the use of the ChatGLM3-6B model. For a more comprehensive web demo,
+it is recommended to use 'composite_demo'.
+
+Usage:
+- Run the script using Streamlit: `streamlit run web_demo_streamlit.py`
+- Adjust the model parameters from the sidebar.
+- Enter questions in the chat input box and interact with the ChatGLM3-6B model.
+
+Note: Ensure 'streamlit' and 'transformers' libraries are installed and the required model checkpoints are available.
+"""
+
+
+import os
+from transformers import AutoTokenizer, AutoModel
+from flask import Flask, request, jsonify
+
+MODEL_PATH = os.environ.get('MODEL_PATH', "/home/zy/LLM/chatglm3-6b-32k/")
+TOKENIZER_PATH = os.environ.get("TOKENIZER_PATH", MODEL_PATH)
+app = Flask(__name__)
+
+def get_model():
+    glm_tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
+    glm_model = AutoModel.from_pretrained(MODEL_PATH, trust_remote_code=True, device_map="auto").eval()
+    return glm_tokenizer, glm_model
+
+
+tokenizer, model = get_model()
+
+
+def glm3_answer(question):
+    prompt = question
+    history = ""
+    past_key_values = ""
+    max_length = 8192
+    top_p = 0.8
+    temperature = 0.15
+    answer = "LLM出现问题了，请稍等。"
+    for response, history, past_key_values in model.stream_chat(
+            tokenizer,
+            prompt,
+            history,
+            past_key_values=past_key_values,
+            max_length=max_length,
+            top_p=top_p,
+            temperature=temperature,
+            return_past_key_values=True,
+    ):
+        answer = response
+    return answer
+
+
+@app.route('/question_to_answer', methods=['POST'])
+def handle_question():
+    data = request.json
+    result = glm3_answer(data['question'])
+    return jsonify(result)
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
